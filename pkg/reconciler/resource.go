@@ -97,6 +97,7 @@ type DesiredStateWithGetter interface {
 type ResourceReconciler interface {
 	CreateIfNotExist(runtime.Object, DesiredState) (created bool, object runtime.Object, err error)
 	ReconcileResource(runtime.Object, DesiredState) (*reconcile.Result, error)
+	ReconcileResourceDiff(runtime.Object, DesiredState) (bool, *reconcile.Result, error)
 }
 
 type StaticDesiredState string
@@ -526,6 +527,183 @@ func (r *GenericResourceReconciler) ReconcileResource(desired runtime.Object, de
 		}
 	}
 	return nil, nil
+}
+
+// ReconcileResourceDiff reconciles various kubernetes types and return diff
+func (r *GenericResourceReconciler) ReconcileResourceDiff(desired runtime.Object, desiredState DesiredState) (bool, *reconcile.Result, error) {
+	resourceDetails, gvk, err := r.resourceDetails(desired)
+	if err != nil {
+		return false, nil, errors.WrapIf(err, "failed to get resource details")
+	}
+	log := r.resourceLog(desired, resourceDetails...)
+	debugLog := log.V(1)
+	traceLog := log.V(3)
+	state := desiredState
+	if ds, ok := desiredState.(DesiredStateWithStaticState); ok {
+		state = ds.DesiredState()
+	} else if ds, ok := desiredState.(DesiredStateWithGetter); ok {
+		state = ds.GetDesiredState()
+	}
+	switch state {
+	case StateCreated:
+		created, _, err := r.CreateIfNotExist(desired, desiredState)
+		if err == nil && created {
+			return true, nil, nil
+		}
+		if err != nil {
+			return false, nil, errors.WrapIfWithDetails(err, "failed to create resource", resourceDetails...)
+		}
+	default:
+		created, current, err := r.CreateIfNotExist(desired, desiredState)
+		if err == nil && created {
+			return false, nil, nil
+		}
+		if err != nil {
+			return false, nil, errors.WrapIfWithDetails(err, "failed to create resource", resourceDetails...)
+		}
+
+		if metaObject, ok := current.(metav1.Object); ok {
+			if metaObject.GetDeletionTimestamp() != nil {
+				log.Info(fmt.Sprintf("object %s is being deleted, backing off", metaObject.GetSelfLink()))
+				return false, &reconcile.Result{RequeueAfter: time.Second * 2}, nil
+			}
+			if !created {
+				if desiredMetaObject, ok := desired.(metav1.Object); ok {
+					base := types.MetaBase{
+						Annotations: desiredMetaObject.GetAnnotations(),
+						Labels:      desiredMetaObject.GetLabels(),
+					}
+					if metaObject, ok := current.DeepCopyObject().(metav1.Object); ok {
+						merged := base.Merge(metav1.ObjectMeta{
+							Labels:      metaObject.GetLabels(),
+							Annotations: metaObject.GetAnnotations(),
+						})
+						desiredMetaObject.SetAnnotations(merged.Annotations)
+						desiredMetaObject.SetLabels(merged.Labels)
+					}
+				}
+
+				if _, ok := metaObject.GetAnnotations()[types.BanzaiCloudManagedComponent]; !ok {
+					if desiredMetaObject, ok := desired.(metav1.Object); ok {
+						a := desiredMetaObject.GetAnnotations()
+						delete(a, types.BanzaiCloudManagedComponent)
+						desiredMetaObject.SetAnnotations(a)
+					}
+				}
+			}
+		}
+
+		if ds, ok := desiredState.(DesiredStateShouldUpdate); ok {
+			should, err := ds.ShouldUpdate(current.DeepCopyObject(), desired.DeepCopyObject())
+			if err != nil {
+				return false, nil, err
+			}
+			if !should {
+				return false, nil, nil
+			}
+		}
+
+		// last chance to hook into the desired state armed with the knowledge of the current state
+		err = desiredState.BeforeUpdate(current, desired)
+		if err != nil {
+			return false, nil, errors.WrapIfWithDetails(err, "failed to get desired state dynamically", resourceDetails...)
+		}
+
+		patchResult, err := r.Options.PatchMaker.Calculate(current, desired, r.Options.PatchCalculateOptions...)
+		if err != nil {
+			debugLog.Info("could not match objects", "error", err)
+		} else if patchResult.IsEmpty() {
+			debugLog.Info("resource is in sync")
+			return false, nil, nil
+		} else {
+			if gvk.Kind == "Secret" {
+				debugLog.Info("resource diff")
+			} else {
+				debugLog.Info("resource diff", "patch", string(patchResult.Patch))
+				traceLog.Info("resource states",
+					"current", string(patchResult.Current),
+					"modified", string(patchResult.Modified),
+					"original", string(patchResult.Original))
+			}
+		}
+
+		if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(desired); err != nil {
+			log.Error(err, "Failed to set last applied annotation", "desired", desired)
+		}
+
+		metaAccessor := meta.NewAccessor()
+
+		currentResourceVersion, err := metaAccessor.ResourceVersion(current)
+		if err != nil {
+			return false, nil, errors.WrapIfWithDetails(err, "failed to access resourceVersion from metadata", resourceDetails...)
+		}
+		if err := metaAccessor.SetResourceVersion(desired, currentResourceVersion); err != nil {
+			return false, nil, errors.WrapIfWithDetails(err, "failed to set resourceVersion in metadata", resourceDetails...)
+		}
+
+		debugLog.Info("updating resource")
+		var updateOptions []client.UpdateOption
+		if ds, ok := desiredState.(DesiredStateWithUpdateOptions); ok {
+			updateOptions = append(updateOptions, ds.GetUpdateOptions()...)
+		}
+		if err := r.Client.Update(context.TODO(), desired.(client.Object), updateOptions...); err != nil {
+			sErr, ok := err.(*apierrors.StatusError)
+			if ok && (sErr.ErrStatus.Code == 422 && sErr.ErrStatus.Reason == metav1.StatusReasonInvalid) && r.shouldRecreate(sErr) {
+				if r.Options.EnableRecreateWorkloadOnImmutableFieldChange {
+					if !r.Options.RecreateEnabledResourceCondition(gvk, sErr.ErrStatus) {
+						return false, nil, errors.WrapIfWithDetails(err, "resource type is not allowed to be recreated", resourceDetails...)
+					}
+					log.Error(err, "failed to update resource, trying to recreate", resourceDetails...)
+					if r.Options.RecreateImmediately {
+						err := r.Client.Delete(context.TODO(), current.(client.Object),
+							r.Options.RecreatePropagationPolicy,
+						)
+						if err != nil {
+							return false, nil, errors.WrapIfWithDetails(err, "failed to delete current resource", resourceDetails...)
+						}
+						if err := metaAccessor.SetResourceVersion(desired, ""); err != nil {
+							return false, nil, errors.WrapIfWithDetails(err, "unable to clear resourceVersion", resourceDetails...)
+						}
+						created, _, err := r.CreateIfNotExist(desired, desiredState)
+						if err == nil {
+							if !created {
+								return false, nil, errors.New("resource already exists")
+							}
+							return false, nil, nil
+						}
+						if err != nil {
+							return false, nil, errors.WrapIfWithDetails(err, "failed to recreate resource", resourceDetails...)
+						}
+					}
+					err := r.Client.Delete(context.TODO(), current.(client.Object),
+						// wait until all dependent resources get cleared up
+						client.PropagationPolicy(metav1.DeletePropagationForeground),
+					)
+					if err != nil {
+						return false, nil, errors.WrapIfWithDetails(err, "failed to delete current resource", resourceDetails...)
+					}
+					return false, &reconcile.Result{
+						Requeue:      true,
+						RequeueAfter: time.Second * time.Duration(utils.PointerToInt32(r.Options.RecreateRequeueDelay)),
+					}, nil
+				} else {
+					return false, nil, errors.WrapIf(sErr, r.Options.EnableRecreateWorkloadOnImmutableFieldChangeHelp)
+				}
+			}
+			return false, nil, errors.WrapIfWithDetails(err, "updating resource failed", resourceDetails...)
+		}
+
+		debugLog.Info("resource updated")
+		return true, nil, nil
+
+	case StateAbsent:
+		_, err := r.delete(desired, desiredState)
+		if err != nil {
+			return false, nil, errors.WrapIfWithDetails(err, "failed to delete resource", resourceDetails...)
+		}
+		return false, nil, nil
+	}
+	return false, nil, nil
 }
 
 func (r *GenericResourceReconciler) fromDesired(desired runtime.Object) (runtime.Object, error) {
