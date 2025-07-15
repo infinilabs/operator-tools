@@ -453,9 +453,9 @@ func (r *GenericResourceReconciler) ReconcileResource(desired runtime.Object, de
 			}
 		}
 
-		if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(desired); err != nil {
-			log.Error(err, "Failed to set last applied annotation", "desired", desired)
-		}
+		//if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(desired); err != nil {
+		//	log.Error(err, "Failed to set last applied annotation", "desired", desired)
+		//}
 
 		metaAccessor := meta.NewAccessor()
 
@@ -627,9 +627,9 @@ func (r *GenericResourceReconciler) ReconcileResourceDiff(desired runtime.Object
 			}
 		}
 
-		if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(desired); err != nil {
-			log.Error(err, "Failed to set last applied annotation", "desired", desired)
-		}
+		//if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(desired); err != nil {
+		//	log.Error(err, "Failed to set last applied annotation", "desired", desired)
+		//}
 
 		metaAccessor := meta.NewAccessor()
 
@@ -746,9 +746,9 @@ func (r *GenericResourceReconciler) CreateIfNotExist(desired runtime.Object, des
 		return false, nil, errors.WrapIfWithDetails(err, "getting resource failed", resourceDetails...)
 	}
 	if apierrors.IsNotFound(err) {
-		if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(desired); err != nil {
-			log.Error(err, "Failed to set last applied annotation", "desired", desired)
-		}
+		//if err := patch.DefaultAnnotator.SetLastAppliedAnnotation(desired); err != nil {
+		//	log.Error(err, "Failed to set last applied annotation", "desired", desired)
+		//}
 		if desiredState != nil {
 			err = desiredState.BeforeCreate(desired)
 			if err != nil {
