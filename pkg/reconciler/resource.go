@@ -556,7 +556,7 @@ func (r *GenericResourceReconciler) ReconcileResourceDiff(desired runtime.Object
 	default:
 		created, current, err := r.CreateIfNotExist(desired, desiredState)
 		if err == nil && created {
-			return false, nil, nil
+			return true, nil, nil
 		}
 		if err != nil {
 			return false, nil, errors.WrapIfWithDetails(err, "failed to create resource", resourceDetails...)
